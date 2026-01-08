@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+# /home/kali/pg_recon/pg_recon.lib
+# Library of recon functions for PG/OSCP workflows.
+# Intended to be sourced by /home/kali/pg_recon.sh
+
+# ----- helpers -----
+log()  { echo "[+] $*"; }
+warn() { echo "[!] $*" >&2; }
+
+require_env() {
+  local v
+  for v in "$@"; do
+    [[ -n "${!v:-}" ]] || { warn "Missing required variable: $v"; return 1; }
+  done
+}
+
+# Ensure directory exists and is owned by the invoking user, even when running with sudo
+ensure_dir_owned() {
+  local dir="$1"
+  local u g
+  u="${OWNER:-${SUDO_USER:-$(id -un)}}"
+  g="${OWNER_GROUP:-$(id -gn "$u" 2>/dev/null || echo "$u")}"
+
+  if [[ $(id -u) -eq 0 ]]; then
+    install -d -m 755 -o "$u" -g "$g" "$dir"
+  else
+    install -d -m 755 "$dir"
+  fi
+}
+
+# Print the scan type + the exact command being executed (shell-escaped)
+print_cmd() {
+  local label="$1"
+  shift
+  echo "[+] Running: $label"
+  printf '[+] Command: '
+  printf '%q ' "$@"
+  echo
+}
+
+# Extract ONLY "open" ports from gnmap (ignores open|filtered + filtered + closed)
+extract_open_ports_from_gnmap() {
+  local gnmap_file="$1"
+  [[ -f "$gnmap_file" ]] || return 0
+
+  grep -i "Ports:" "$gnmap_file" \
+    | awk -F'Ports: ' '{print $2}' \
+    | tr ',' '\n' \
+    | awk -F'/' '$2 == "open" {print $1}' \
+    | sort -n | uniq
+}
+
+# Union open ports across multiple gnmap files -> "22,80,445"
+union_open_ports_csv() {
+  local ports
+  ports="$(
+    for f in "$@"; do
+      [[ -f "$f" ]] && extract_open_ports_from_gnmap "$f" || true
+    done | sort -n | uniq
+  )"
+  [[ -n "$ports" ]] && echo "$ports" | paste -sd, - || echo ""
+}
+
+# Run gobuster; if it detects wildcard error, prompt to rerun with --exclude-length <N>.
+# Args:
+#   $1 = label (for print_cmd)
+#   $2 = cmd_file (where you log the command)
+#   $3 = out_file (gobuster output file)
+#   $@ = gobuster command array (starting at arg 4)
+run_gobuster_with_wildcard_prompt() {
+  local label="$1"
+  local cmd_file="$2"
+  local out_file="$3"
+  shift 3
+
+  local -a cmd=( "$@" )
+  local stderr_tmp
+  stderr_tmp="$(mktemp)"
+
+  # Create a per-target cache file so you only get asked once per host:port
+  # Uses BASE_DIR if available; falls back to /tmp.
+  local cache_dir="${BASE_DIR:-/tmp}"
+  local cache_file="$cache_dir/.gobuster_wildcard_cache"
+  touch "$cache_file" 2>/dev/null || true
+
+  # Log initial command
+  {
+    echo "# $label"
+    printf '%q ' "${cmd[@]}"
+    echo -e "\n"
+  } >> "$cmd_file"
+
+  print_cmd "$label" "${cmd[@]}"
+  "${cmd[@]}" 2> >(tee -a "$stderr_tmp" >&2) || true
+
+  # Detect wildcard error + extract length
+  if grep -qiE "exclude the response length|set the wildcard option|To continue please exclude|matches the provided options" "$stderr_tmp"; then
+    local len
+    len="$(grep -Eo 'Length:\s*[0-9]+' "$stderr_tmp" | head -n 1 | awk '{print $2}')"
+
+    if [[ -z "${len:-}" ]]; then
+      echo "[!] Gobuster wildcard detected, but couldn't parse Length."
+      echo "[*] Manual options: --exclude-length <N> or --wildcard"
+      rm -f "$stderr_tmp"
+      return 0
+    fi
+
+    # Try to find existing cached decision for this exact URL (from the cmd array)
+    # Extract the URL argument after -u
+    local url=""
+    for ((i=0; i<${#cmd[@]}; i++)); do
+      if [[ "${cmd[i]}" == "-u" && $((i+1)) -lt ${#cmd[@]} ]]; then
+        url="${cmd[i+1]}"
+        break
+      fi
+    done
+
+    # Cache key = URL
+    local cached_len=""
+    if [[ -n "$url" && -f "$cache_file" ]]; then
+      cached_len="$(awk -v u="$url" '$1==u {print $2; exit}' "$cache_file" 2>/dev/null || true)"
+    fi
+
+    # If we already accepted an exclude-length for this URL, reuse it automatically
+    if [[ -n "${cached_len:-}" ]]; then
+      local -a cmd2=( "${cmd[@]}" --exclude-length "$cached_len" )
+
+      {
+        echo "# $label (auto rerun with cached --exclude-length $cached_len)"
+        printf '%q ' "${cmd2[@]}"
+        echo -e "\n"
+      } >> "$cmd_file"
+
+      print_cmd "$label (exclude-length $cached_len)" "${cmd2[@]}"
+      "${cmd2[@]}" || true
+      rm -f "$stderr_tmp"
+      return 0
+    fi
+
+    # Otherwise, prompt the user from /dev/tty (works with sudo)
+    echo "[!] Gobuster wildcard detected: non-existing URLs appear valid."
+    echo "[!] Suggested exclude length: $len"
+    local ans=""
+    read -r -p "[?] Re-run with --exclude-length $len ? (y/N): " ans < /dev/tty || ans=""
+    ans="${ans,,}"
+
+    if [[ "$ans" == "y" || "$ans" == "yes" ]]; then
+      # Save decision for this URL so we don't ask again
+      if [[ -n "$url" ]]; then
+        # Remove any old entry first
+        if [[ -f "$cache_file" ]]; then
+          grep -v -F -- "$url " "$cache_file" > "${cache_file}.tmp" 2>/dev/null || true
+          mv "${cache_file}.tmp" "$cache_file" 2>/dev/null || true
+        fi
+        echo "$url $len" >> "$cache_file" 2>/dev/null || true
+      fi
+
+      local -a cmd2=( "${cmd[@]}" --exclude-length "$len" )
+
+      {
+        echo "# $label (rerun with --exclude-length $len)"
+        printf '%q ' "${cmd2[@]}"
+        echo -e "\n"
+      } >> "$cmd_file"
+
+      print_cmd "$label (exclude-length $len)" "${cmd2[@]}"
+      "${cmd2[@]}" || true
+    else
+      echo "[*] Skipping rerun. Manual option: add --exclude-length $len"
+    fi
+  fi
+
+  rm -f "$stderr_tmp"
+}
+
+
+# ----- Nmap functions -----
+nmap_basic_tcp() {
+  require_env IP TCP_BASIC_OUT || return 1
+
+  local cmd=(
+    nmap -sS -Pn -n --top-ports 1000 -T4 --open
+    "$IP" -oN -
+  )
+
+  print_cmd "Nmap BASIC TCP (top 1000)" "${cmd[@]}"
+  "${cmd[@]}" | tee "$TCP_BASIC_OUT"
+}
+
+nmap_all_tcp() {
+  require_env IP TCP_FULL_OUT TCP_FULL_GNMAP || return 1
+
+  local cmd=(
+    nmap -sS -Pn -n -p- -T4 --open -sV --version-all
+    "$IP" -oN "$TCP_FULL_OUT" -oG "$TCP_FULL_GNMAP"
+  )
+
+  print_cmd "Nmap ALL TCP (all ports + versions)" "${cmd[@]}"
+  "${cmd[@]}"
+}
+
+nmap_basic_udp() {
+  require_env IP UDP_BASIC_OUT UDP_BASIC_GNMAP || return 1
+
+  local cmd=(
+    nmap -sU -Pn -n --top-ports 100 -T4 --open
+    "$IP" -oN "$UDP_BASIC_OUT" -oG "$UDP_BASIC_GNMAP"
+  )
+
+  print_cmd "Nmap BASIC UDP (top 100)" "${cmd[@]}"
+  "${cmd[@]}"
+}
+
+# Medium UDP: more coverage than top-100, but not full -p-
+# This is what we run for "all" and "nmap" modes.
+nmap_medium_udp() {
+  require_env IP UDP_MEDIUM_OUT UDP_MEDIUM_GNMAP || return 1
+
+  local cmd=(
+    nmap -sU -Pn -n --top-ports 1000 -T4 --open -sV
+    --version-intensity 5 --max-retries 1 --host-timeout 20m
+    "$IP" -oN "$UDP_MEDIUM_OUT" -oG "$UDP_MEDIUM_GNMAP"
+  )
+
+  print_cmd "Nmap MEDIUM UDP (top 1000 + bounded)" "${cmd[@]}"
+  "${cmd[@]}"
+}
+
+# Full UDP is intentionally only for explicit udp-all selection.
+nmap_all_udp() {
+  require_env IP UDP_FULL_OUT UDP_FULL_GNMAP || return 1
+
+  local cmd=(
+    nmap -sU -Pn -n -p- -T4 --open -sV --version-all
+    --max-retries 2 --host-timeout 60m
+    "$IP" -oN "$UDP_FULL_OUT" -oG "$UDP_FULL_GNMAP"
+  )
+
+  print_cmd "Nmap ALL UDP (full -p-)" "${cmd[@]}"
+  "${cmd[@]}"
+}
+
+# Run scripts on open ports (TCP+UDP). Ignores filtered/open|filtered by design.
+nmap_scripts_on_open_ports() {
+  require_env IP TCP_FULL_GNMAP TCP_SCRIPTS_OUT UDP_SCRIPTS_OUT || return 1
+
+  local tcp_ports udp_ports
+  tcp_ports="$(union_open_ports_csv "$TCP_FULL_GNMAP")"
+
+  # UDP ports can come from whichever UDP scans were run:
+  # - basic (top 100)
+  # - medium (top 1000)
+  # - full (udp-all)
+  udp_ports="$(union_open_ports_csv \
+    "${UDP_BASIC_GNMAP:-/dev/null}" \
+    "${UDP_MEDIUM_GNMAP:-/dev/null}" \
+    "${UDP_FULL_GNMAP:-/dev/null}"
+  )"
+
+  log "Open TCP ports (open only): ${tcp_ports:-<none>}"
+  log "Open UDP ports (open only): ${udp_ports:-<none>}"
+
+  if [[ -n "$tcp_ports" ]]; then
+    local cmd_tcp=( nmap -sS -Pn -n -p "$tcp_ports" -sC -sV "$IP" -oN "$TCP_SCRIPTS_OUT" )
+    print_cmd "Nmap SCRIPTS TCP (open ports)" "${cmd_tcp[@]}"
+    "${cmd_tcp[@]}"
+  else
+    warn "No open TCP ports found; skipping TCP script scan."
+  fi
+
+  if [[ -n "$udp_ports" ]]; then
+    local cmd_udp=( nmap -sU -Pn -n -p "$udp_ports" -sC -sV "$IP" -oN "$UDP_SCRIPTS_OUT" )
+    print_cmd "Nmap SCRIPTS UDP (open ports)" "${cmd_udp[@]}"
+    "${cmd_udp[@]}"
+  else
+    warn "No open UDP ports found; skipping UDP script scan."
+  fi
+}
+
+# ----- HTTP helpers (based on full TCP output) -----
+# Extract HTTP(S) ports from normal (-oN) and gnmap (-oG) outputs
+detect_http_ports() {
+  require_env TCP_FULL_OUT TCP_FULL_GNMAP || return 1
+
+  local have_data=false
+  {
+    if [[ -f "$TCP_FULL_OUT" ]]; then
+      have_data=true
+      awk '
+        $2=="open" && $1 ~ /\/tcp$/ && tolower($3) ~ /http/ {
+          split($1, a, "/"); print a[1]
+        }
+      ' "$TCP_FULL_OUT" 2>/dev/null
+    fi
+
+    if [[ -f "$TCP_FULL_GNMAP" ]]; then
+      have_data=true
+      awk -F'[, ]+' '
+        /Ports:/ {
+          for (i=1; i<=NF; i++) {
+            if ($i ~ /^[0-9]+\/open\/tcp/ && tolower($i) ~ /http/) {
+              split($i, a, "/"); print a[1]
+            }
+          }
+        }
+      ' "$TCP_FULL_GNMAP" 2>/dev/null
+    fi
+  } | grep -E '^[0-9]+$' | sort -n | uniq
+
+  $have_data || { warn "No TCP scan outputs found; run nmap-tcp-all first."; return 1; }
+}
+
+# Determine scheme for a port.
+# Hard rule: port 80 is ALWAYS http.
+scheme_for_port() {
+  require_env TCP_FULL_OUT || return 1
+  local p="$1"
+  local svc=""
+
+  if [[ "$p" == "80" ]]; then
+    echo "http"
+    return 0
+  fi
+
+  if [[ "$p" == "443" || "$p" == "8443" ]]; then
+    echo "https"
+    return 0
+  fi
+
+  svc="$(awk -v port="$p" '
+    $1 ~ ("^"port"/tcp$") && $2=="open" {print tolower($3); exit}
+  ' "$TCP_FULL_OUT" 2>/dev/null || true)"
+
+  if [[ "$svc" == *"ssl/http"* || "$svc" == *"https"* ]]; then
+    echo "https"
+  else
+    echo "http"
+  fi
+}
+
+# ----- Directory search (Gobuster) -----
+dir_search_basic() {
+  require_env IP SAFE_NAME GOBUSTER_DIR GOBUSTER_CMD_DIR TCP_FULL_OUT || return 1
+
+  if ! command -v gobuster >/dev/null 2>&1; then
+    warn "gobuster not found. Install: sudo apt-get update && sudo apt-get install -y gobuster"
+    return 1
+  fi
+
+  local wl="/usr/share/wordlists/dirb/common.txt"
+  [[ -f "$wl" ]] || { warn "Missing wordlist: $wl"; return 1; }
+
+  local ports port scheme url out cmd_file extra
+  ports="$(detect_http_ports || true)"
+  [[ -n "$ports" ]] || { warn "No HTTP services detected; skipping BASIC directory search."; return 0; }
+
+  log "Directory search BASIC on HTTP ports: $(echo "$ports" | paste -sd, -)"
+
+  while read -r port; do
+    [[ -z "$port" ]] && continue
+
+    scheme="$(scheme_for_port "$port")"
+    url="${scheme}://${IP}:${port}"
+    extra=""
+    [[ "$scheme" == "https" ]] && extra="-k"
+
+    out="$GOBUSTER_DIR/${SAFE_NAME}_${IP}_${port}_dir_basic.txt"
+    cmd_file="$GOBUSTER_CMD_DIR/${SAFE_NAME}_${IP}_${port}_commands.txt"
+
+    local cmd=( gobuster dir -u "$url" -w "$wl" -t 50 )
+    [[ -n "$extra" ]] && cmd+=( "$extra" )
+    cmd+=( -o "$out" )
+
+    run_gobuster_with_wildcard_prompt "Gobuster BASIC ($port)" "$cmd_file" "$out" "${cmd[@]}"
+  done <<< "$ports"
+}
+
+dir_search_advanced() {
+  require_env IP SAFE_NAME GOBUSTER_DIR GOBUSTER_CMD_DIR TCP_FULL_OUT || return 1
+
+  if ! command -v gobuster >/dev/null 2>&1; then
+    warn "gobuster not found. Install: sudo apt-get update && sudo apt-get install -y gobuster"
+    return 1
+  fi
+
+  local wl="/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt"
+  [[ -f "$wl" ]] || { warn "Missing wordlist: $wl"; return 1; }
+
+  local ports port scheme url out cmd_file extra
+  ports="$(detect_http_ports || true)"
+  [[ -n "$ports" ]] || { warn "No HTTP services detected; skipping ADVANCED directory search."; return 0; }
+
+  log "Directory search ADVANCED on HTTP ports: $(echo "$ports" | paste -sd, -)"
+
+  while read -r port; do
+    [[ -z "$port" ]] && continue
+
+    scheme="$(scheme_for_port "$port")"
+    url="${scheme}://${IP}:${port}"
+    extra=""
+    [[ "$scheme" == "https" ]] && extra="-k"
+
+    out="$GOBUSTER_DIR/${SAFE_NAME}_${IP}_${port}_dir_advanced.txt"
+    cmd_file="$GOBUSTER_CMD_DIR/${SAFE_NAME}_${IP}_${port}_commands.txt"
+
+    local cmd=( gobuster dir -u "$url" -w "$wl" -t 50 )
+    [[ -n "$extra" ]] && cmd+=( "$extra" )
+    cmd+=( -o "$out" )
+
+    run_gobuster_with_wildcard_prompt "Gobuster ADVANCED ($port)" "$cmd_file" "$out" "${cmd[@]}"
+  done <<< "$ports"
+}
+
+# ----- Directory/File search (Gobuster: common files) -----
+dir_search_files() {
+  require_env IP SAFE_NAME GOBUSTER_DIR GOBUSTER_CMD_DIR TCP_FULL_OUT || return 1
+
+  if ! command -v gobuster >/dev/null 2>&1; then
+    warn "gobuster not found. Install: sudo apt-get update && sudo apt-get install -y gobuster"
+    return 1
+  fi
+
+  local wl="/usr/share/wordlists/dirb/common.txt"
+  local exts="php,asp,aspx,jsp,html,txt,bak,old,zip,tar,tar.gz"
+  [[ -f "$wl" ]] || { warn "Missing wordlist: $wl"; return 1; }
+
+  local ports port scheme url out cmd_file extra
+  ports="$(detect_http_ports || true)"
+  [[ -n "$ports" ]] || { warn "No HTTP services detected; skipping FILE search."; return 0; }
+
+  log "Directory search FILES on HTTP ports: $(echo "$ports" | paste -sd, -)"
+
+  while read -r port; do
+    [[ -z "$port" ]] && continue
+
+    scheme="$(scheme_for_port "$port")"
+    url="${scheme}://${IP}:${port}"
+    extra=""
+    [[ "$scheme" == "https" ]] && extra="-k"
+
+    out="$GOBUSTER_DIR/${SAFE_NAME}_${IP}_${port}_files.txt"
+    cmd_file="$GOBUSTER_CMD_DIR/${SAFE_NAME}_${IP}_${port}_commands.txt"
+
+    local cmd=( gobuster dir -u "$url" -w "$wl" -x "$exts" -t 50 )
+    [[ -n "$extra" ]] && cmd+=( "$extra" )
+    cmd+=( -o "$out" )
+
+    run_gobuster_with_wildcard_prompt "Gobuster FILE search ($port)" "$cmd_file" "$out" "${cmd[@]}"
+  done <<< "$ports"
+}
+
+# ----- Directory search (Gobuster: lowercase medium wordlist) -----
+dir_search_lowercase() {
+  require_env IP SAFE_NAME GOBUSTER_DIR GOBUSTER_CMD_DIR TCP_FULL_OUT || return 1
+
+  if ! command -v gobuster >/dev/null 2>&1; then
+    warn "gobuster not found. Install: sudo apt-get update && sudo apt-get install -y gobuster"
+    return 1
+  fi
+
+  local wl="/usr/share/wordlists/dirbuster/directory-list-lowercase-2.3-medium.txt"
+  [[ -f "$wl" ]] || { warn "Missing wordlist: $wl"; return 1; }
+
+  local ports port scheme url out cmd_file extra
+  ports="$(detect_http_ports || true)"
+  [[ -n "$ports" ]] || { warn "No HTTP services detected; skipping LOWERCASE dir search."; return 0; }
+
+  log "Directory search LOWERCASE (medium) on HTTP ports: $(echo "$ports" | paste -sd, -)"
+
+  while read -r port; do
+    [[ -z "$port" ]] && continue
+
+    scheme="$(scheme_for_port "$port")"
+    url="${scheme}://${IP}:${port}"
+    extra=""
+    [[ "$scheme" == "https" ]] && extra="-k"
+
+    out="$GOBUSTER_DIR/${SAFE_NAME}_${IP}_${port}_dir_lowercase.txt"
+    cmd_file="$GOBUSTER_CMD_DIR/${SAFE_NAME}_${IP}_${port}_commands.txt"
+
+    local cmd=( gobuster dir -u "$url" -w "$wl" -t 50 )
+    [[ -n "$extra" ]] && cmd+=( "$extra" )
+    cmd+=( -o "$out" )
+
+    run_gobuster_with_wildcard_prompt "Gobuster LOWERCASE dir ($port)" "$cmd_file" "$out" "${cmd[@]}"
+  done <<< "$ports"
+}
+
+# ----- Web snapshots (curl) -----
+web_curl_snapshots() {
+  require_env IP WEB_DIR TCP_FULL_OUT || return 1
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl not found. Install: sudo apt-get install -y curl"
+    return 1
+  fi
+
+  local port scheme url port_dir out cmd_log
+  local -a ports=()
+  mapfile -t ports < <(detect_http_ports || true)
+  [[ ${#ports[@]} -gt 0 ]] || { warn "No HTTP services detected; skipping curl snapshots."; return 0; }
+
+  log "Curl snapshots on HTTP ports: $(printf '%s\n' "${ports[@]}" | paste -sd, -)"
+
+  for port in "${ports[@]}"; do
+    [[ -z "$port" ]] && continue
+
+    scheme="$(scheme_for_port "$port")"
+    url="${scheme}://${IP}:${port}"
+    port_dir="$WEB_DIR/${IP}_${port}"
+    ensure_dir_owned "$port_dir"
+
+    out="$port_dir/curl.txt"
+    cmd_log="$port_dir/commands.txt"
+
+    local -a cmd=( curl -k -L -sS -i --connect-timeout 5 --max-time 30 "$url" )
+
+    {
+      echo "# Curl snapshot ($url)"
+      printf '%q ' "${cmd[@]}"
+      echo -e "\n"
+    } >> "$cmd_log"
+
+    print_cmd "Curl snapshot ($port)" "${cmd[@]}"
+    "${cmd[@]}" | tee "$out" || true
+  done
+}
+
+# ----- Web vuln scan (nikto) -----
+web_nikto_scan() {
+  require_env IP WEB_DIR TCP_FULL_OUT || return 1
+
+  if ! command -v nikto >/dev/null 2>&1; then
+    warn "nikto not found. Install: sudo apt-get install -y nikto"
+    return 1
+  fi
+
+  local port scheme url port_dir out cmd_log
+  local -a ports=()
+  mapfile -t ports < <(detect_http_ports || true)
+  [[ ${#ports[@]} -gt 0 ]] || { warn "No HTTP services detected; skipping nikto scan."; return 0; }
+
+  log "Nikto scan on HTTP ports: $(printf '%s\n' "${ports[@]}" | paste -sd, -)"
+
+  for port in "${ports[@]}"; do
+    [[ -z "$port" ]] && continue
+
+    scheme="$(scheme_for_port "$port")"
+    url="${scheme}://${IP}:${port}"
+    port_dir="$WEB_DIR/${IP}_${port}"
+    ensure_dir_owned "$port_dir"
+
+    out="$port_dir/nikto.txt"
+    cmd_log="$port_dir/commands.txt"
+
+    local -a cmd=( nikto -h "$url" -output "$out" -Format txt )
+
+    {
+      echo "# Nikto ($url)"
+      printf '%q ' "${cmd[@]}"
+      echo -e "\n"
+    } >> "$cmd_log"
+
+    print_cmd "Nikto ($port)" "${cmd[@]}"
+    "${cmd[@]}" || true
+  done
+}
+
+# Run all directory-related gobuster scans
+dir_all() {
+  dir_search_basic
+  dir_search_advanced
+  dir_search_files
+  dir_search_lowercase
+}
+
+# Run full web recon (dir busting + curl + nikto)
+web_all() {
+  dir_all
+  web_curl_snapshots
+  web_nikto_scan
+}
